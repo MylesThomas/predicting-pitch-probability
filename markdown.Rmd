@@ -1,0 +1,1017 @@
+---
+title: "title"
+author: "Myles Thomas"
+date: "12/9/2021"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r, include=FALSE}
+library(tidyverse)
+library(FNN)
+library(neuralnet)
+library(caret)
+library(lightgbm)
+library(xgboost)
+library(caret)
+```
+
+
+## Obtain data
+
+```{r}
+# load all data
+train.full <- readr::read_csv(file = "C:/Users/Myles/OneDrive/Documents/pitches_train.csv")
+test.full <- readr::read_csv(file = "C:/Users/Myles/OneDrive/Documents/pitches_test.csv")
+
+df <- dplyr::bind_rows(train.full, test.full)
+df %>% head(10)
+```
+
+
+## Scrub data
+
+```{r}
+# check for NA
+table(is.na(df))
+```
+Drop columns I KNOW I am not going to use.
+
+```{r}
+# batterid/pitcherid/cid (cannot extract insight from a player id without info on who the id is)
+df <- df %>%
+  select(-c(batterid:cid))
+
+# the last 5 rows are the format for the answer, for now it is all NA values
+df <- df %>%
+  select(inning:basecode_before)
+
+# now, check for na
+table(is.na(df))
+
+# This outputs same as number of df NA values (160306)
+df %>%
+  count(pitch_type)
+```
+The only NA are from test set not having pitch_type (obviously) so the data is clean.
+
+## Data exploration
+
+```{r}
+# I want to obtain insights / feature engineer based on the pitch data - only grab training data for now
+df <- train.full
+```
+
+
+I also want to derive a few variables from the givens, such as looking at score difference instead of points for/against since that might be more relevant. Or, using knowledge on the handedness of the pitcher/batter to derive a column that lets us know if it is L vs L, L vs R, R vs L, or R vs R.
+
+```{r}
+# add in score difference
+df <- df %>%
+  mutate(score_diff = field_score - bat_score_before)
+
+# add column that gives pitcher vs batter combination
+df <- df %>%
+  mutate(pitcher_vs_batter = 
+case_when(
+  is_lhp==1 & is_lhb==1 ~ "L pitching to L",
+  is_lhp==1 & is_lhb==0 ~ "L pitching to R",
+  is_lhp==0 & is_lhb==1 ~ "R pitching to L",
+  is_lhp==0 & is_lhb==0 ~ "R pitching to R"
+  )
+)
+```
+
+I am also going to reorder the pitch_type column so the x axis goes from the most common pitch (fastball) and on down.
+
+```{r}
+# re-order response var
+df <- df %>%
+  mutate(pitch_type = factor(pitch_type, ordered = TRUE, 
+                             levels = c("FF", "SL", "FT", "CH", "CB"),
+                             labels = c("4-Seam", "Slider", "2-Seam", "Changeup", "Curveball")
+                             ))
+```
+
+
+
+
+
+```{r}
+# function to repeat the data viz's, looking at proportion of observations to see trends
+plot_fun <- function(df, string) {
+  # get formula for facet_wrap
+  formula <- paste("~", string)
+  # plot
+  df %>%
+    ggplot(aes_string(x = "pitch_type", fill = "pitch_type")) + # pitch_type is always x-axis, fill is for color
+    geom_bar(aes(y=..count../sum(..count..))) +
+    facet_wrap(facets = formula, scales = "free_y") + # make 1 plot for each level of ind. var, make scale free
+    labs(title = string,
+         x = "pitch",
+         y = "proportion") +
+    scale_fill_brewer(palette = "Dark2") + 
+    theme(axis.text.x = element_blank())  # get rid of name since we have fill for that
+}
+
+```
+
+
+```{r}
+# plot over each possible model input
+plot_fun(df, "inning")
+plot_fun(df, "is_bottom")
+plot_fun(df, "balls")
+plot_fun(df, "strikes")
+plot_fun(df, "outs_before")
+plot_fun(df, "pitcher_vs_batter")
+plot_fun(df, "bat_score_before")
+plot_fun(df, "field_score")
+plot_fun(df, "score_diff")
+plot_fun(df, "basecode_before")
+
+```
+
+Change the 3 columns based on game score (field score, bats score before, and my derived variable for score difference) to handle the outliers since I could not get any info from those graphs:
+
+```{r}
+df2 <- df # make temp dataframe
+
+# choose a margin of lead that is considered a blowout
+blowout_num <- 4
+
+# choose a number of points that is considered a lot of points for 1 team
+points_cap <- 8
+
+# putting outliers all in same bin - blowouts
+df2 <- df2 %>% 
+  mutate(scorediff_2 = case_when(
+    score_diff <= -blowout_num ~ -blowout_num,
+    score_diff >= blowout_num ~ blowout_num,
+    TRUE ~ as.numeric(score_diff)
+  ),
+  
+  bats_score_2 = case_when(
+    bat_score_before >= points_cap ~ points_cap,
+    TRUE ~ as.numeric(bat_score_before)
+  ),
+  field_score_2 = case_when(
+    field_score >= points_cap ~ points_cap,
+    TRUE ~ as.numeric(field_score)
+  )
+)
+```
+
+```{r}
+# 3 new plots
+plot_fun(df=df2, string = "scorediff_2")
+plot_fun(df=df2, string = "bats_score_2")
+plot_fun(df=df2, string = "field_score_2")
+
+```
+
+
+
+Notes for data exploration main effects: 
+
+bats_score: As it increases, the pitcher is less likely to throw 2 seamers and is more likely to come in with a slider. bats_score will stay in the model, but with the outliers moved back down to a sensible number to avoid noise.
+
+field_score: Does not seem to matter (makes sense, your team's points doesn't exactly affect how you play as pitcher). 
+
+score_diff: Only seems to matter if the game is tied, which may be associated with a game being tied late. 
+
+
+inning: Matters some, but the relationships are not linear. For example, slider use goes up as the game progress and really peaks in the most heated innings.
+
+I will change inning into 3 groups: First 5 (1-5), End of game / Beginning of extras (6-13), Long Extras w/ small sample size (14+)
+
+
+is_bottom: In general, it does not appear to matter if you are in the top or bottom of an inning.
+
+balls: 0 balls and 3 balls appear to have different distributions than 1-2 balls, this makes sense due at ball 0 being 'looser and free', but at ball 3 you are being more careful. I will turn this into 3 categorical groups: Ball 0, Balls 1-2, Ball 3.
+
+strikes: Most pitches have a roughly linear relationship (ex. slider probability increases as strikes increase, whereas 2 seam fastballs decrease as strikes increase), but the change up does not have a linear relationship at all. I will turn this variable from numeric into 3 categorical groups: 0, 1, 2.
+
+outs_before: In general, doesn't really matter.
+
+pitcher_vs_batter: L to L and R to R are essentially the same distribution, but LvR and RvsL are not. I will combine the same hand ones and leave the opposite hand ones to have 3 groups: Same Dominant Hand, L pitching to R, R pitching to L.
+
+
+basecode_before: I am seeing any relationships that stand out, almost all of the distributions are identical so in general this does not matter. This one surprises me as I expected 'worse' scenarios for the pitcher to cause a different style of pitching to try and get out of the hole.
+
+
+## Model Data 
+
+The goal is to get predicted probabilites for each pitch in the testing dataset
+
+With a propblem that has imbalanced classification, I need a machine learning algorithm that can produce calibrated probabilities
+
+Examples
+
+- LDA
+- Naive Bayes
+- Artificial neural network
+
+First, I will try to perform Linear Discriminant Analysis
+
+```{r}
+df <- train.full %>% select(-c(batterid:cid))
+df
+```
+
+Variable selection:
+
+
+```{r}
+# find means of predictors for each outcome
+mean_ff <- sapply(df[df$pitch_type == "FF", -8], mean)
+mean_sl <- sapply(df[df$pitch_type == "SL", -8], mean)
+mean_ft <- sapply(df[df$pitch_type == "FT", -8], mean)
+mean_ch <- sapply(df[df$pitch_type == "CH", -8], mean)
+mean_cb <- sapply(df[df$pitch_type == "CB", -8], mean)
+
+# look at differences
+diffs <- data.frame(mean_ff, mean_sl, mean_ft, mean_ch, mean_cb)
+diffs
+```
+
+Discriminant Analysis:
+
+```{r}
+# standardize variables
+standardized <- predict(preProcess(df, method = c("center", "scale")), newdata = df)
+
+# remove outliers
+
+# first, looking how many outliers each column has
+standardized2 <- standardized %>% select(-pitch_type)
+threshold <- 3
+
+for (i in 1:dim(standardized2)[2]) {
+  print(table(ifelse(abs(standardized2[, i]) > threshold, 1, 0 )))
+}
+
+# use pmax to see if a row has an outliers
+standardized$max_val <- Rmpfr::pmax(standardized$inning, standardized$is_bottom , standardized$balls , standardized$strikes , standardized$outs_before , standardized$is_lhp , standardized$is_lhb , standardized$bat_score_before , standardized$field_score, standardized$basecode_before)
+
+# removing outliers
+df <- standardized %>% filter(max_val <= threshold)
+
+# now that outliers are gone, remove the column for max_val since it will ruin algo
+df <- df %>% select(-max_val)
+```
+
+Train algo:
+
+```{r}
+library(DiscriMiner)
+vars <- c("pitch_type",rownames(diffs)) # using all for now
+
+set.seed(12)
+train <- sample(row.names(df), 0.6*dim(df)[1])
+val <- setdiff(row.names(df), train)
+
+train <- df[train,vars]
+val <- df[val,vars]
+
+# remove response var from train df that goes into algo
+train2 <- train %>% select(-c(pitch_type))
+
+# perform discriminant analysis
+da <- DiscriMiner::linDA(train2, train$pitch_type)
+
+# look at all results
+da
+```
+
+Performance measures (on valid set)
+
+
+```{r}
+# get predictions from validation set
+
+# remove pitch_type from val so that unlabeled data is fed in 
+val2 <- val %>% select(-c(pitch_type))
+
+# made predictions with model
+preds <- classify(da, newdata = val2)
+```
+
+The 'scores' from this output are not in probability form - and fastball is going to be the prediction for most due to class imbalances.
+
+```{r}
+# looking at confusion matrix
+confusionMatrix(preds$pred_class,
+                as.factor(val$pitch_type),
+                positive="FF")
+```
+
+
+
+```{r}
+# get predicted probabilities for each class
+
+# turn 'scores' into dataframe
+scores <- as.data.frame(preds$scores)
+
+# get sums of scores for each row
+# exp() each of the 5 class outcomes scores and divide by exp of totals to get implied probability
+totals <- exp(scores$CB) + exp(scores$CH) + exp(scores$FF) + exp(scores$FT) + exp(scores$SL) 
+
+cb <- exp(scores$CB) / totals
+ch <- exp(scores$CH) / totals
+ff <- exp(scores$FF) / totals
+ft <- exp(scores$FT) / totals
+sl <- exp(scores$SL) / totals
+
+# put this into a dataframe and view
+pred_probs <- data.frame(cb, ch, ff, ft, sl) 
+
+# look at pred probs on valid data
+pred_probs
+```
+
+
+```{r}
+# look at means - they are not representative 
+summary(pred_probs)
+```
+
+
+Adjusting for prior probabilities:
+
+The average probability prediction produced by the model approximates the proportion of training instances that are each class, because this is the average actual value of the class variables
+
+If classes are not equally frequent, or their frequency in the sample does not reflect reality, the classification functions can be improved by incorporating priors/real probabilities of class membership.
+
+I will again after oversampling the data, and then incorporating the priors/real probabilities of class membership.
+
+
+
+
+```{r}
+# first, get class probabilities
+summary <- df %>%
+  count(pitch_type) %>%
+  mutate(total_n = sum(n),
+         class_probs = n/total_n) ; summary
+
+prior_class_probs <- summary$class_probs
+```
+
+
+```{r}
+# add in a column for ID to do next step
+df$id <- 1:dim(df)[1]
+
+# get ids for each underrepresented class
+cb_df <- df[df$pitch_type=="CB", ]
+cb_rows <- cb_df$id
+
+ch_df <- df[df$pitch_type=="CH", ]
+ch_rows <- ch_df$id
+
+ft_df <- df[df$pitch_type=="FT", ]
+ft_rows <- ft_df$id
+
+sl_df <- df[df$pitch_type=="SL", ]
+sl_rows <- sl_df$id
+
+# remove ID column as it will mess with algo as an input
+df <- df %>% select(-id)
+
+# make 4 new dfs and bind together with the original 181996 rows of data for fastballs
+set.seed(11)
+cb <- df[sample(cb_rows, size = 181996, replace = T), ]
+ch <- df[sample(ch_rows, size = 181996, replace = T), ]
+ff <- df[df$pitch_type == "FF", ]
+ft <- df[sample(ft_rows, size = 181996, replace = T), ]
+sl <- df[sample(sl_rows, size = 181996, replace = T), ]
+
+# bind
+binded <- bind_rows(cb, ch, ff, ft, sl)
+
+# looking at class balance
+binded %>%
+  count(pitch_type)
+```
+
+
+``
+
+
+
+
+```{r}
+# train algo on oversampled df
+
+# remove pitch type to have df for inputs
+binded2 <- binded %>% select(-pitch_type)
+
+# Linear discriminant analysis (LDA)
+da2 <- DiscriMiner::linDA(binded2, binded$pitch_type)
+
+da2
+
+# made 'predictions' with model on same training data to view predicted probabilities
+preds <- classify(da2, newdata = binded2)
+
+# looking at confusion matrix
+confusionMatrix(preds$pred_class,
+                as.factor(binded$pitch_type),
+                positive="FF")
+
+
+# get predicted probabilities for each class
+
+# turn 'scores' into dataframe
+scores <- as.data.frame(preds$scores)
+
+# get sums of scores for each row
+# exp() each of the 5 class outcomes scores and divide by exp of totals to get implied probability
+totals <- exp(scores$CB) + exp(scores$CH) + exp(scores$FF) + exp(scores$FT) + exp(scores$SL) 
+
+cb <- exp(scores$CB) / totals
+ch <- exp(scores$CH) / totals
+ff <- exp(scores$FF) / totals
+ft <- exp(scores$FT) / totals
+sl <- exp(scores$SL) / totals
+
+# put this into a dataframe and view
+pred_probs <- data.frame(cb, ch, ff, ft, sl) 
+
+# look at pred probs
+pred_probs
+```
+
+```{r}
+summary(pred_probs)
+```
+
+These predictions are awful and accuracy is even worse
+
+But, these predictions do not have the population truth baked in, so that is the next step
+
+
+```{r}
+# copy the lda because we are going to change the constants
+da3 <- da2
+```
+
+
+
+```{r}
+# Adding log(probability of being class = j) to the classification function for each class 'j'
+
+# next, make the new constants (row 1 of da$function is the constants used before - i am changing those)
+constant_cb = da2$functions[1, 1] + log(prior_class_probs[1])
+constant_ch = da2$functions[1, 2] + log(prior_class_probs[2])
+constant_ff = da2$functions[1, 3] + log(prior_class_probs[3])
+constant_ft = da2$functions[1, 4] + log(prior_class_probs[4])
+constant_sl = da2$functions[1, 5] + log(prior_class_probs[5])
+
+# look all old constants vs new
+comp <- data.frame(pitch_type = summary$pitch_type,
+                   old_constant = da2$functions[1, ],
+                   new_constant = c(constant_cb, constant_ch, constant_ff, constant_ft, constant_sl)
+                   )
+comp
+
+
+# replace the constants row with updated ones
+da3$functions[1, ] <- comp$new
+```
+
+
+Now that I have a model that was trained on the balanced data set AND takes into account priors, I will see how it performs on the validation dataset from step 1 when I made train/test splits on the first iteration of the model
+
+
+```{r}
+# made predictions again with newest model
+new_preds2 <- classify(da3, newdata = val2)
+
+# looking at confusion matrix
+confusionMatrix(new_preds2$pred_class,
+                as.factor(val$pitch_type),
+                positive="FF")
+
+# derive predicted probabilities, again
+scores <- as.data.frame(new_preds2$scores)
+
+# get sums of scores for each row
+# exp() each of the 5 class outcomes scores and divide by exp of totals to get implied probability
+totals <- exp(scores$CB) + exp(scores$CH) + exp(scores$FF) + exp(scores$FT) + exp(scores$SL) 
+
+cb <- exp(scores$CB) / totals
+ch <- exp(scores$CH) / totals
+ff <- exp(scores$FF) / totals
+ft <- exp(scores$FT) / totals
+sl <- exp(scores$SL) / totals
+
+# put this into a dataframe and view
+pred_probs2 <- data.frame(cb, ch, ff, ft, sl) 
+
+# look at pred probs after adjusting for predicted probabilities
+pred_probs2
+```
+
+
+```{r}
+# look at means.
+summary(pred_probs2)
+```
+
+
+
+Accuracy has only improved slightly, but the predicted probabilities are now much more representative of the population truth and even though fastball gets predicted almost every time, this is what optimizes accuracy. Of course, this is not great though.
+
+
+Typically at this point I would observe misclassification costs, which probably depends on who is at the plate/the score/situation/men on base etc. because you cannot just assume everything is going to be a fastball or slider.
+
+For example, if 1 batter was very good at hitting a certain pitch out of the park, we would really want to focus on classifying his Sliders correctly, and would lean on predicting slider more since missing out on sliders is much worse than missing out on a changeup (which in this hypothetical, batter is not good at hitting changeups)
+
+
+
+Next, 
+
+Accuracy of 40% is not good even if it is a 5 class response variable
+
+Going to use feature engineering to try and get better model inputs and try again with a different model that can take in categorical data better (Neural Network)
+
+
+Using notes from when I visualized all of the data, I derived categorical vars that I think may work better than the data provided
+
+
+```{r}
+# write function to feature engineer and prepare a dataframe for the model
+prep_data <- function(dataframe, points_cap) { # df, the points cap for deciding bats_score_before outliers
+  # bring in dataframe
+  df <- dataframe
+  
+  # add in score difference
+  df <- df %>%
+    mutate(score_diff = field_score - bat_score_before)
+  
+  # add column that gives pitcher vs batter combination
+  df <- df %>%
+    mutate(pitcher_vs_batter = 
+  case_when(
+    is_lhp==1 & is_lhb==1 ~ "L pitching to L",
+    is_lhp==1 & is_lhb==0 ~ "L pitching to R",
+    is_lhp==0 & is_lhb==1 ~ "R pitching to L",
+    is_lhp==0 & is_lhb==0 ~ "R pitching to R"
+    )
+  )
+
+  # feature engineer: model inputs
+  df2 <- df %>%
+    mutate(new_inning = case_when(
+      inning <= 5 ~ "first5",
+      inning <= 13 & inning >= 6 ~ "late-extras",
+      inning >= 14 ~ "super-late-extras"
+    ),
+    new_balls = case_when(
+      balls == 0 ~ "none",
+      balls >= 1 & balls <= 2 ~ "1-2",
+      balls == 3 ~ "three"
+    ),
+    new_strikes = as.factor(strikes),
+    new_pitcher_vs_batter = case_when(
+      pitcher_vs_batter == "L pitching to L" | pitcher_vs_batter == "R pitching to R" ~ "same-dominant",
+      pitcher_vs_batter == "R pitching to L" ~ "R-pitching-to-L",
+      pitcher_vs_batter == "L pitching to R" ~ "L-pitching-to-R"
+    ),
+    new_bats_score_before = case_when(
+      bat_score_before >= points_cap ~ points_cap,
+      TRUE ~ as.numeric(bat_score_before)
+    ),
+    tie_game = ifelse(bat_score_before == field_score, 1, 0)
+  )
+  
+  # select only columns for model
+  df3 <- df2 %>%
+    select(new_inning:tie_game)
+  
+  # remove 'new' from the colnames
+  colnames(df3) <- str_remove_all(string = colnames(df3), pattern = "new_")
+  
+  # return
+  return(df3)
+}
+```
+
+
+
+```{r}
+# engineer training set to have the correct features
+df <- prep_data(dataframe = train.full, points_cap = 6)
+
+# add pitch type back into data
+df$y <- train.full$pitch_type
+
+df
+```
+
+Preprocess data for Neural Network.
+
+```{r, eval=FALSE}
+# delete this chunk - testing stuff
+
+train_df_norm3 <- train_df_norm2
+
+train_df_norm3$y <- as.factor(train_df_norm3$y)
+
+train_df_norm4 <- train_df_norm3[1:100, ]
+
+# train algo
+set.seed(11)
+
+# slick way to make formula, since y~. won't work
+n <- names(train_df_norm4)
+f <- as.formula(paste("y ~", paste(n[!n %in% c("y")], collapse = " + ")))
+
+# turn this chunk not to run - will take awhile
+train_df_norm4
+nn2 <- neuralnet::neuralnet(formula = f,
+                            data = train_df_norm4,
+                            #hidden = 6,
+                            linear.output = F)
+
+# plot the network
+plot(nn1, rep="best")
+train_df_norm4 ; tester_df
+
+tester_df <- train.df3[1:100, ]
+
+
+# getting predicted probabilities from training data
+train.pred2 <- compute(nn2, tester_df)
+probs2 <- train.pred2$net.result
+
+# put in dataframe
+train_preds_df <- probs2 %>%
+  as.data.frame() %>%
+  rename("CB" = V1, "CH" = V2, "FF" = V3, "FT" = V4, "SL" = V5)
+
+# get predicted class using case_when
+x <- apply(train_preds_df, 1, which.max) 
+train_preds_df$high_prob2 <- case_when(x == 1 ~ "CB", x == 2 ~ "CH", x == 3 ~ "FF", x == 4 ~ "FT", x == 5 ~ "SL")
+
+
+# the usual assessment for classification
+train.cmat <- confusionMatrix(as.factor(train_preds_df$high_prob2),
+                              as.factor(train_df_norm4$y),
+                              positive = "FF")
+
+train.cmat
+
+```
+
+
+```{r}
+# partition
+set.seed(11)
+
+trainIndex <- createDataPartition(df$y, p=.67, list=F)
+train.df <- df[trainIndex, ]
+valid.df <- df[-trainIndex, ]
+
+# looking to see if createDataPartition put the 
+round(prop.table(table(train.df$y)), 2) ; round(prop.table(table(valid.df$y)), 2)
+
+# make sure both dataframes currently only have the model predictor variables
+train.df2 <- train.df %>% select(-c(y))
+valid.df2 <- valid.df %>% select(-c(y))
+
+# # then, normalize (based on training data) 
+# neural network needs values on 0,1 scale
+normalized_values <- preProcess(train.df2, method=c("range"))
+
+# normalize both train and validation using these normalized values
+train_df_norm <- predict(normalized_values, train.df2)
+valid_df_norm <- predict(normalized_values, valid.df2)
+
+# compute m - 1 dummy variables
+# and remove the columns that we derive dummies from
+train_df_norm2 <- train_df_norm %>% 
+  fastDummies::dummy_cols(remove_first_dummy = T) %>% 
+  select(-c(inning:pitcher_vs_batter))
+
+valid_df_norm2 <- valid_df_norm %>% 
+  fastDummies::dummy_cols(remove_first_dummy = T) %>% 
+  select(-c(inning:pitcher_vs_batter))
+
+summary(train_df_norm2)
+summary(valid_df_norm2)
+
+train_df_norm2 ; valid_df_norm2
+```
+
+
+```{r}
+# change column names because neural network function error
+colnames(train_df_norm2) <- str_remove_all(string = colnames(train_df_norm2), pattern = "_")
+colnames(train_df_norm2) <- str_remove_all(string = colnames(train_df_norm2), pattern = "-")
+colnames(valid_df_norm2) <- str_remove_all(string = colnames(valid_df_norm2), pattern = "_")
+colnames(valid_df_norm2) <- str_remove_all(string = colnames(valid_df_norm2), pattern = "-")
+
+colnames(train.df2) <- str_remove_all(string = colnames(train.df2), pattern = "_")
+colnames(train.df2) <- str_remove_all(string = colnames(train.df2), pattern = "-")
+colnames(valid.df2) <- str_remove_all(string = colnames(valid.df2), pattern = "_")
+colnames(valid.df2) <- str_remove_all(string = colnames(valid.df2), pattern = "-")
+
+
+train_df_norm2 ; valid_df_norm2 ; train.df2 ; valid.df2
+```
+
+```{r}
+# get dummy vars for data (not normalized) that will be fed into the compute() function to make predicted probabilities
+
+# compute m - 1 dummy variables
+# and remove the columns that we derive dummies from
+train.df3 <- train.df2 %>% 
+  fastDummies::dummy_cols(remove_first_dummy = T) %>% 
+  select(-c(inning:pitchervsbatter))
+
+valid.df3 <- valid.df2 %>% 
+  fastDummies::dummy_cols(remove_first_dummy = T) %>% 
+  select(-c(inning:pitchervsbatter))
+```
+
+
+```{r, eval=FALSE}
+# add response var back into train df
+train_df_norm2$y <- train.df$y
+
+# train algo
+set.seed(11)
+
+# slick way to make formula, since y~. won't work
+n <- names(train_df_norm2)
+f <- as.formula(paste("y ~", paste(n[!n %in% c("y")], collapse = " + ")))
+
+# turn this chunk not to run - will take awhile
+train_df_norm2
+nn0 <- neuralnet::neuralnet(formula = f,
+                            data = train_df_norm2,
+                            hidden = 0,
+                            linear.output = F,
+                            stepmax = 9^12)
+
+# plot the network
+plot(nn0, rep="best")
+```
+
+
+```{r}
+# getting predicted probabilities from training data
+train.pred <- neuralnet::compute(nn0, train.df3)
+probs <- train.pred$net.result
+
+train_preds_df <- probs %>%
+  as.data.frame() %>%
+  rename("CB" = V1, "CH" = V2, "FF" = V3, "FT" = V4, "SL" = V5)
+
+# get predicted class using case_when
+x <- apply(train_preds_df, 1, which.max) 
+train_preds_df$highest_prob <- case_when(x == 1 ~ "CB", x == 2 ~ "CH", x == 3 ~ "FF", x == 4 ~ "FT", x == 5 ~ "SL")
+
+# look at head of predicted probs
+train_preds_df %>% head(20)
+
+
+# the usual assessment for classification
+train.cmat <- confusionMatrix(as.factor(train_preds_df$highest_prob),
+                              as.factor(train_df_norm2$y),
+                              positive = "FF")
+
+train.cmat
+```
+
+
+
+Finally, trying with an Extra Gradient Boost and a Light Gradient Boosting Machine to minimize log loss when calculating class probabilities, this should improve the predicted class probabilities
+
+
+## Multiclass Classification with XGBoost
+
+the XGBoost objective for multi class classification of multi:softprob returns "predicted probability of each data point belonging to each class".
+
+
+```{r}
+# trying with original data before wrangling
+df <- readr::read_csv(file = "Q2_pitches_train.csv") %>% select(-c(batterid:cid))
+```
+
+
+```{r}
+# We must convert factors to numeric
+# They must be starting from number 0 to use multiclass
+# For instance: 0, 1, 2, 3, 4, 5...
+df$pitch_type <- as.numeric(as.factor(df$pitch_type)) - 1L
+
+# reorder data to have y first before splitting
+df <- df %>% select(pitch_type, inning:is_lhb, bat_score_before:basecode_before)
+df
+
+# index data
+set.seed(12)
+indexes = createDataPartition(df$pitch_type, p = .75, list = F)
+train = df[indexes, ]
+test = df[-indexes, ]
+
+train_x = data.matrix(train[, 2:11])
+train_y = data.matrix(train[,1])
+
+test_x = data.matrix(test[, 2:11])
+test_y = data.matrix(test[, 1])
+
+xgb_train = xgb.DMatrix(data = train_x, label = train_y)
+xgb_test = xgb.DMatrix(data = test_x, label = test_y)
+
+
+numberOfClasses <- length(unique(df$pitch_type)) 
+
+xgb_params <- list("objective" = "multi:softprob",
+                   "eval_metric" = "mlogloss",
+                   "num_class" = numberOfClasses)
+
+
+
+# Fit cv.nfold * cv.nround XGB models and save OOF predictions
+cv_model <- xgb.cv(params = xgb_params,
+                   data = xgb_train, 
+                   nrounds = 10, # number of XGBoost rounds
+                   nfold = 10,    # number of cv folds
+                   #maxdepth = 2,
+                   verbose = FALSE,
+                   prediction = T)
+print(cv_model)
+```
+
+
+```{r}
+# predictions on test set
+best_model <- xgb.train(params = xgb_params,
+                       data = xgb_train,
+                       nrounds = 10)
+```
+
+
+```{r}
+# Predict hold-out test set
+test_pred <- predict(best_model, newdata = xgb_test)
+
+test_prediction <- matrix(test_pred, nrow = numberOfClasses,
+                          ncol=length(test_pred)/numberOfClasses) %>%
+  t() %>%
+  data.frame()
+
+test_prediction
+```
+
+
+```{r}
+# confusion matrix
+x <- apply(test_prediction, 1, which.max) 
+test_prediction$pred <- case_when(x == 1 ~ "CB", x == 2 ~ "CH", x == 3 ~ "FF", x == 4 ~ "FT", x == 5 ~ "SL")
+
+test_truth <- test[, 1]
+x <- test_truth$pitch_type
+obs  <- case_when(x == 0 ~ "CB", x == 1 ~ "CH", x == 2 ~ "FF", x == 3 ~ "FT", x == 4 ~ "SL")
+
+cm <- caret::confusionMatrix(as.factor(obs),
+                             as.factor(test_prediction$pred))
+
+cm
+```
+
+
+
+## Multiclass Classification with Light Gradient Boosting Machine
+
+
+
+```{r}
+# trying with original data before wrangling
+df <- readr::read_csv(file = "Q2_pitches_train.csv") %>% select(-c(batterid:cid))
+```
+
+
+```{r}
+# We must convert factors to numeric
+# They must be starting from number 0 to use multiclass
+# For instance: 0, 1, 2, 3, 4, 5...
+df$pitch_type <- as.numeric(as.factor(df$pitch_type)) - 1L
+
+# reorder data to have y first before splitting
+df <- df %>% select(pitch_type, inning:is_lhb, bat_score_before:basecode_before)
+
+# split
+set.seed(11)
+indexes = createDataPartition(df$pitch_type, p = 7/10, list = F)
+train = df[indexes, ]
+test = df[-indexes, ]
+
+# checking for even class distributions
+prop.table(table(train$pitch_type)) ; prop.table(table(test$pitch_type))
+
+# turn into matrices
+m_train <- as.matrix(train)
+m_test <- as.matrix(test)
+m_train %>% dim() ; m_test %>% dim()
+
+# get into lgb.Dataset for model entry
+dtrain <- lgb.Dataset(data = m_train[, 2L:11L], label = m_train[, 1L])
+dtest <- lgb.Dataset.create.valid(dtrain, data = m_test[, 2L:11L], label = m_test[, 1L])
+valids <- list(test = dtest)
+
+# Set parameters
+params <- list(
+    objective = "multiclass"
+    , metric = "multi_logloss"
+    , num_class = 5L
+    , min_data = 1L
+    , learning_rate = 0.1
+    #, is_unbalance = T
+)
+
+light_gmb_model <- lgb.train(
+    params
+    , dtrain
+    , 100L
+    , valids
+    , early_stopping_rounds = 10L
+)
+
+# Predicted probabilities
+my_preds <- predict(light_gmb_model, m_test[, 2L:11L], reshape = T)
+
+my_preds
+```
+
+
+```{r}
+# Get class membership
+preds_df <- my_preds %>%
+  as.data.frame() %>%
+  rename("CB" = V1, "CH" = V2, "FF" = V3, "FT" = V4, "SL" = V5)
+
+x <- apply(preds_df, 1, which.max) 
+preds_df$pred <- case_when(x == 1 ~ "CB", x == 2 ~ "CH", x == 3 ~ "FF", x == 4 ~ "FT", x == 5 ~ "SL")
+preds_df
+# Add in the observed truth from test set
+x <- m_test[, 1L]
+preds_df$obs <- case_when(x == 0 ~ "CB", x == 1 ~ "CH", x == 2 ~ "FF", x == 3 ~ "FT", x == 4 ~ "SL")
+
+# Get the confusion matrix
+caret::confusionMatrix(
+  data = as.factor(preds_df$pred),
+  reference = as.factor(preds_df$obs)
+)
+```
+
+The improved log loss and best yet accuracy seen (near 41%) makes the Light Gradient Boosting Machine the winner.
+
+time to write those to CSV at the bottom of the .Rmd
+
+
+```{r}
+# load data
+test.full <- readr::read_csv(file = "Q2_pitches_test.csv") %>% select(-c(batterid:cid, FF:CH)) ; test.full
+
+# turn into matrices
+m <- as.matrix(test.full)
+
+# Predicted probabilities
+my_preds <- predict(light_gmb_model, m[, 1L:10L], reshape = T)
+
+my_preds
+```
+
+
+
+```{r}
+# made predictions again with best model
+# put this into a dataframe and view
+answer <- as.data.frame(my_preds) %>%
+  rename("CB" = V1, "CH" = V2, "FF" = V3, "FT" = V4, "SL" = V5) ; answer
+
+# reorder in the order initial dataframe had the pitches in
+answer <- answer %>% select(FF, FT, CB, SL, CH)
+
+# look at pred probs
+answer
+
+# look at summary to make sure it looks right
+summary(answer)
+
+# write to my drive
+write.csv(answer, file = "Q2PredictedProbabilities.csv")
+```
